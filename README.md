@@ -1,100 +1,115 @@
-# RAG Pipeline for Docs (LangGraph + Python)
+# LangGraph + Python RAG Documentation Assistant
 
-This project builds a retrieval-augmented generation (RAG) pipeline using LangGraph and Python to answer questions from a repository's `docs/` folder.
+This project creates a retrieval-augmented generation (RAG) system for repository documentation using:
 
-## Features
-- Loads documents recursively from `docs/`
-- Supports `.md`, `.txt`, `.rst`, `.csv`, `.json`, `.yaml`, `.yml`, and `.pdf`
-- Splits content into chunks
-- Embeds chunks with OpenAI embeddings
-- Stores vectors in ChromaDB
-- Retrieves relevant context using similarity search
-- Uses a LangGraph workflow to answer questions
+- Python
+- LangGraph
+- LangChain
+- OpenAI embeddings and chat models
+- ChromaDB
+- FastAPI
+- Streamlit
+
+## Architecture
+
+The system loads documentation from a `docs/` directory, splits it into chunks, embeds those chunks, stores them in ChromaDB, and retrieves the most relevant segments for a user question before generating a grounded answer.
 
 ## Project structure
 
 ```text
 .
-├── .env.example
-├── .gitignore
-├── README.md
-├── requirements.txt
+├── api.py
+├── app.py
 ├── rag_pipeline.py
+├── requirements.txt
+├── .env.example
+├── README.md
 ├── docs/
-├── chroma_db/
-└── .venv/
+│   └── README.md
+└── chroma_db/
 ```
 
 ## Setup
 
-1. Clone the repository.
-2. Create a virtual environment:
+1. Create a virtual environment:
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate   # Linux/macOS
-# .venv\Scripts\activate   # Windows
+source .venv/bin/activate
 ```
 
-3. Install dependencies:
+2. Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-4. Copy the environment template and add your API key:
+3. Configure environment variables:
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env`:
+Then update `.env`:
 
 ```env
 OPENAI_API_KEY=your_openai_api_key_here
+DOCS_DIR=./docs
+CHROMA_DIR=./chroma_db
+COLLECTION_NAME=ecommerce_docs
+CHUNK_SIZE=1000
+CHUNK_OVERLAP=200
+TOP_K=5
+LLM_MODEL=gpt-4o-mini
+EMBEDDING_MODEL=text-embedding-3-small
 ```
 
-5. Add your files into the `docs/` directory.
+4. Add files to `docs/`.
 
-## Run the pipeline
-
-Interactive mode:
+## Run the CLI workflow
 
 ```bash
 python rag_pipeline.py
 ```
 
-You can then ask questions like:
+## Run the API
 
-```text
-Ask a question about the docs (or type 'exit'): What is the architecture of the platform?
+```bash
+uvicorn api:app --reload
 ```
 
-## Python API usage
+Then open:
 
-```python
-from rag_pipeline import answer_question
+- `http://localhost:8000/docs` for Swagger UI
+- `http://localhost:8000/health` for health check
 
-response = answer_question("What is the architecture of the platform?")
-print(response)
+Example request:
+
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question":"What does this project do?"}'
+```
+
+## Run the Streamlit app
+
+```bash
+streamlit run app.py
+```
+
+## Example document structure
+
+```text
+docs/
+├── architecture.md
+├── process.md
+├── system-overview.md
+└── api.md
 ```
 
 ## Notes
-- The default documents directory is `./docs`.
-- If the folder does not exist, the pipeline will return a graceful message.
-- ChromaDB data is persisted in `./chroma_db`.
 
-## Dependencies
+- The system persists the vector database under `./chroma_db`.
+- If no `docs/` folder exists, the app will show a clear message rather than crashing.
+- Use `.md`, `.txt`, `.json`, `.yaml`, `.html`, `.xml`, and `.pdf` files in the docs folder.
 
-Main libraries:
-- langchain
-- langchain-community
-- langchain-openai
-- langgraph
-- chromadb
-- python-dotenv
-- pypdf
-
-## License
-
-MIT

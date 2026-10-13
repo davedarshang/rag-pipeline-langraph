@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, TypedDict
+from typing import Any, List, Optional, TypedDict
 
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
@@ -13,9 +16,17 @@ from langgraph.graph import END, StateGraph
 
 load_dotenv()
 
-DOCS_DIR = Path(os.getenv("DOCS_DIR", "./docs")).resolve()
-CHROMA_DIR = Path(os.getenv("CHROMA_DIR", "./chroma_db")).resolve()
-COLLECTION_NAME = "ecommerce_docs"
+
+@dataclass
+class RAGConfig:
+    docs_dir: Path = Path(os.getenv("DOCS_DIR", "./docs")).resolve()
+    chroma_dir: Path = Path(os.getenv("CHROMA_DIR", "./chroma_db")).resolve()
+    collection_name: str = os.getenv("COLLECTION_NAME", "ecommerce_docs")
+    chunk_size: int = int(os.getenv("CHUNK_SIZE", "1000"))
+    chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", "200"))
+    top_k: int = int(os.getenv("TOP_K", "5"))
+    embedding_model: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+    llm_model: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
 
 class RAGState(TypedDict):
@@ -26,7 +37,95 @@ class RAGState(TypedDict):
     answer: str
 
 
-def _load_text_file(file_path: Path) -> List[Document]:
+SUPPORTED_TEXT_EXTENSIONS = {
+    ".md",
+    ".txt",
+    ".rst",
+    ".csv",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".html",
+    ".xml",
+}
+
+
+class RAGService:
+    def __init__(self, config: Optional[RAGConfig] = None):
+        self.config = config or RAGConfig()
+        self.vectorstore: Optional[Chroma] = None
+        self._initialize()
+
+    def _initialize(self) -> None:
+        docs = self.load_documents()
+        if not docs:
+            self.vectorstore = None
+            return
+
+        chunks = split_documents(docs, self.config)
+        self.vectorstore = build_vectorstore(chunks, self.config)
+
+    def load_documents(self) -> List[Document]:
+        if not self.config.docs_dir.exists():
+            print(f"Docs directory not found: {self.config.docs_dir}. Create a docs folder or set DOCS_DIR.")
+            return []
+
+        docs: List[Document] = []
+        for file_path in sorted(self.config.docs_dir.rglob("*")):
+            if file_path.is_dir():
+                continue
+
+            suffix = file_path.suffix.lower()
+            if suffix in SUPPORTED_TEXT_EXTENSIONS:
+                docs.extend(load_text_file(file_path))
+            elif suffix == ".pdf":
+                docs.extend(load_pdf_file(file_path))
+
+        return docs
+
+    def ask(self, question: str) -> str:
+        if not question or not question.strip():
+            return "Please enter a valid question."
+
+        if self.vectorstore is None:
+            return (
+                "No documentation was loaded. Add files under the docs folder and ensure "
+                "the environment is configured with OPENAI_API_KEY."
+            )
+
+        retrieved_docs = self.vectorstore.similarity_search(question, k=self.config.top_k)
+
+        if not retrieved_docs:
+            return "I could not find relevant information in the loaded documentation."
+
+        llm = ChatOpenAI(model=self.config.llm_model, temperature=0)
+        context = "\n\n---\n\n".join(
+            [
+                f"Source: {doc.metadata.get('source', 'unknown')}\n\n{doc.page_content}"
+                for doc in retrieved_docs
+            ]
+        )
+
+        prompt = f"""
+You are a helpful assistant that answers questions using the project documentation.
+
+Use only the information in the context below.
+If the answer is not present, say so clearly.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer concisely and cite the relevant source file names when possible.
+"""
+
+        response = llm.invoke([HumanMessage(content=prompt)])
+        return response.content
+
+
+def load_text_file(file_path: Path) -> List[Document]:
     try:
         loader = TextLoader(str(file_path), encoding="utf-8")
         return loader.load()
@@ -35,7 +134,7 @@ def _load_text_file(file_path: Path) -> List[Document]:
         return []
 
 
-def _load_pdf(file_path: Path) -> List[Document]:
+def load_pdf_file(file_path: Path) -> List[Document]:
     try:
         loader = PyPDFLoader(str(file_path))
         return loader.load()
@@ -44,128 +143,49 @@ def _load_pdf(file_path: Path) -> List[Document]:
         return []
 
 
-def load_documents(docs_dir: Path = DOCS_DIR) -> List[Document]:
-    """Load documents from a directory recursively."""
-    if not docs_dir.exists():
-        print(f"Docs directory not found: {docs_dir}. Add a docs/ folder or set DOCS_DIR.")
-        return []
-
-    supported_text_exts = {
-        ".md",
-        ".txt",
-        ".rst",
-        ".csv",
-        ".json",
-        ".yaml",
-        ".yml",
-    }
-
-    documents: List[Document] = []
-
-    for file_path in sorted(docs_dir.rglob("*")):
-        if file_path.is_dir():
-            continue
-
-        suffix = file_path.suffix.lower()
-
-        if suffix in supported_text_exts:
-            docs = _load_text_file(file_path)
-            documents.extend(docs)
-        elif suffix == ".pdf":
-            docs = _load_pdf(file_path)
-            documents.extend(docs)
-
-    return documents
-
-
-def split_documents(documents: List[Document]) -> List[Document]:
+def split_documents(documents: List[Document], config: RAGConfig) -> List[Document]:
     if not documents:
         return []
 
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
+        chunk_size=config.chunk_size,
+        chunk_overlap=config.chunk_overlap,
         separators=["\n\n", "\n", " ", ""],
     )
     return splitter.split_documents(documents)
 
 
-def build_vectorstore(chunks: List[Document]) -> Chroma:
+def build_vectorstore(chunks: List[Document], config: RAGConfig) -> Chroma:
     if not chunks:
         raise ValueError("No document chunks available to index.")
 
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-
+    embeddings = OpenAIEmbeddings(model=config.embedding_model)
     vectorstore = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
-        collection_name=COLLECTION_NAME,
-        persist_directory=str(CHROMA_DIR),
+        collection_name=config.collection_name,
+        persist_directory=str(config.chroma_dir),
     )
-
     return vectorstore
 
 
-def retrieve_context(state: RAGState) -> RAGState:
-    question = state["question"]
-    chunks = state["chunks"]
+def create_rag_pipeline(config: Optional[RAGConfig] = None) -> StateGraph:
+    cfg = config or RAGConfig()
 
-    if not chunks:
-        state["retrieved_docs"] = []
-        return state
+    class WorkflowState(TypedDict):
+        question: str
+        documents: List[Document]
+        chunks: List[Document]
+        retrieved_docs: List[Document]
+        answer: str
 
-    vectorstore = build_vectorstore(chunks)
-    retrieved_docs = vectorstore.similarity_search(question, k=5)
-    state["retrieved_docs"] = retrieved_docs
-    return state
-
-
-def generate_answer(state: RAGState) -> RAGState:
-    question = state["question"]
-    retrieved_docs = state["retrieved_docs"]
-
-    if not retrieved_docs:
-        state["answer"] = (
-            "I couldn't find relevant information in the docs folder. "
-            "Please make sure the docs directory contains supported files and try again."
-        )
-        return state
-
-    context = "\n\n---\n\n".join(
-        [
-            f"Source: {doc.metadata.get('source', 'unknown')}\n\n{doc.page_content}"
-            for doc in retrieved_docs
-        ]
-    )
-
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-    prompt = f"""
-You are a helpful assistant that answers questions using the project's documentation.
-
-Use only the context below to answer the question. If the answer is not in the context, say so clearly.
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer in a clear and concise way and cite relevant sources when possible.
-"""
-
-    response = llm.invoke([HumanMessage(content=prompt)])
-    state["answer"] = response.content
-    return state
-
-
-def create_rag_pipeline() -> StateGraph:
-    workflow = StateGraph(RAGState)
+    workflow = StateGraph(WorkflowState)
 
     workflow.add_node(
         "load_documents",
         lambda state: {
             "question": state["question"],
-            "documents": load_documents(),
+            "documents": load_documents_from_path(cfg.docs_dir),
             "chunks": [],
             "retrieved_docs": [],
             "answer": "",
@@ -177,14 +197,14 @@ def create_rag_pipeline() -> StateGraph:
         lambda state: {
             "question": state["question"],
             "documents": state["documents"],
-            "chunks": split_documents(state["documents"]),
+            "chunks": split_documents(state["documents"], cfg),
             "retrieved_docs": [],
             "answer": "",
         },
     )
 
-    workflow.add_node("retrieve_context", retrieve_context)
-    workflow.add_node("generate_answer", generate_answer)
+    workflow.add_node("retrieve_context", lambda state: retrieve_context(state, cfg))
+    workflow.add_node("generate_answer", lambda state: generate_answer(state, cfg))
 
     workflow.set_entry_point("load_documents")
     workflow.add_edge("load_documents", "split_documents")
@@ -195,33 +215,91 @@ def create_rag_pipeline() -> StateGraph:
     return workflow.compile()
 
 
-def answer_question(question: str) -> str:
-    app = create_rag_pipeline()
-    result = app.invoke(
-        {
-            "question": question,
-            "documents": [],
-            "chunks": [],
-            "retrieved_docs": [],
-            "answer": "",
-        }
+def load_documents_from_path(docs_dir: Path) -> List[Document]:
+    if not docs_dir.exists():
+        return []
+
+    documents: List[Document] = []
+    for file_path in sorted(docs_dir.rglob("*")):
+        if file_path.is_dir():
+            continue
+        suffix = file_path.suffix.lower()
+        if suffix in SUPPORTED_TEXT_EXTENSIONS:
+            documents.extend(load_text_file(file_path))
+        elif suffix == ".pdf":
+            documents.extend(load_pdf_file(file_path))
+
+    return documents
+
+
+def retrieve_context(state: dict[str, Any], config: RAGConfig) -> dict[str, Any]:
+    question = state["question"]
+    chunks = state["chunks"]
+
+    if not chunks:
+        state["retrieved_docs"] = []
+        return state
+
+    vectorstore = build_vectorstore(chunks, config)
+    state["retrieved_docs"] = vectorstore.similarity_search(question, k=config.top_k)
+    return state
+
+
+def generate_answer(state: dict[str, Any], config: RAGConfig) -> dict[str, Any]:
+    question = state["question"]
+    docs = state["retrieved_docs"]
+
+    if not docs:
+        state["answer"] = "I could not find relevant information in the docs."
+        return state
+
+    context = "\n\n---\n\n".join(
+        [
+            f"Source: {doc.metadata.get('source', 'unknown')}\n\n{doc.page_content}"
+            for doc in docs
+        ]
     )
-    return result["answer"]
+
+    llm = ChatOpenAI(model=config.llm_model, temperature=0)
+    prompt = f"""
+You are a helpful assistant using project documentation.
+
+Context:
+{context}
+
+User question:
+{question}
+
+Answer using only the retrieved context. If the answer is not contained in the context, say so clearly.
+"""
+
+    response = llm.invoke([HumanMessage(content=prompt)])
+    state["answer"] = response.content
+    return state
+
+
+_service: Optional[RAGService] = None
+
+
+def get_rag_service() -> RAGService:
+    global _service
+    if _service is None:
+        _service = RAGService()
+    return _service
+
+
+def answer_question(question: str) -> str:
+    service = get_rag_service()
+    return service.ask(question)
 
 
 if __name__ == "__main__":
-    print("RAG documentation assistant is ready.")
-    print(f"Looking for docs under: {DOCS_DIR}")
-
+    print("LangGraph RAG documentation assistant")
+    print(f"Docs path: {RAGConfig().docs_dir}")
     while True:
-        question = input("\nAsk a question about the docs (or type 'exit'): ")
+        question = input("\nAsk a question about the docs or type 'exit': ")
         if question.strip().lower() in {"exit", "quit", "q"}:
-            print("Goodbye!")
             break
-
-        if not question.strip():
-            continue
-
-        answer = answer_question(question)
         print("\nAnswer:\n")
-        print(answer)
+        print(answer_question(question))
+
